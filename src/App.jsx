@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useRef, useEffect, useImperativeHandle } from 'react';
 import { GoogleMap, useJsApiLoader, Marker, DirectionsRenderer, Polyline } from '@react-google-maps/api';
-import { MapPin, Navigation, Plus, Trash2, Truck, Layers, Eye, EyeOff, FolderPlus, Circle, Printer, Share2, GripVertical, Edit3, Check } from 'lucide-react';
+import { MapPin, Navigation, Plus, Trash2, Truck, Layers, Eye, EyeOff, FolderPlus, Circle, Printer, Share2, GripVertical, Edit3, Check, Lock, Download, Upload } from 'lucide-react';
 import './index.css';
 
 // Helper: Convert 0-based index to letter (A, B, C, ... Z, AA, AB...)
@@ -38,6 +38,16 @@ const GROUP_COLORS = [
 ];
 
 const PIN_COLORS = ['#3b82f6', '#ef4444', '#10b981', '#a855f7', '#f97316', '#ec4899'];
+
+// Storage keys for localStorage persistence
+const STORAGE_KEYS = {
+  GROUPS: 'ai_router_groups',
+  STOPS: 'ai_router_stops',
+  AUTH: 'ai_router_authenticated'
+};
+
+// 4-digit PIN code — change this value or set VITE_PIN_CODE in your .env file
+const PIN_CODE = import.meta.env.VITE_PIN_CODE || '1234';
 
 // Conversion Helpers
 const metersToMiles = (meters) => (meters * 0.000621371).toFixed(2);
@@ -107,6 +117,104 @@ const PlaceComponent = React.forwardRef(({ onPlaceSelect, onInputChange, placeho
   );
 });
 
+// --- PIN Gate Component ---
+const PinGate = ({ children }) => {
+  const [authenticated, setAuthenticated] = useState(() => {
+    return localStorage.getItem(STORAGE_KEYS.AUTH) === 'true';
+  });
+  const [pin, setPin] = useState(['', '', '', '']);
+  const [error, setError] = useState(false);
+  const [shake, setShake] = useState(false);
+  const pinRefs = useRef([]);
+
+  useEffect(() => {
+    if (!authenticated && pinRefs.current[0]) {
+      pinRefs.current[0].focus();
+    }
+  }, [authenticated]);
+
+  if (authenticated) return children;
+
+  const checkPin = (newPin) => {
+    const fullPin = newPin.join('');
+    if (fullPin.length === 4 && newPin.every(d => d !== '')) {
+      if (fullPin === PIN_CODE) {
+        localStorage.setItem(STORAGE_KEYS.AUTH, 'true');
+        setAuthenticated(true);
+      } else {
+        setError(true);
+        setShake(true);
+        setTimeout(() => {
+          setPin(['', '', '', '']);
+          setShake(false);
+          pinRefs.current[0]?.focus();
+        }, 500);
+      }
+    }
+  };
+
+  const handleChange = (index, value) => {
+    if (!/^\d*$/.test(value)) return;
+    const newPin = [...pin];
+    newPin[index] = value.slice(-1);
+    setPin(newPin);
+    setError(false);
+
+    if (value && index < 3) {
+      pinRefs.current[index + 1]?.focus();
+    }
+
+    checkPin(newPin);
+  };
+
+  const handleKeyDown = (index, e) => {
+    if (e.key === 'Backspace' && !pin[index] && index > 0) {
+      pinRefs.current[index - 1]?.focus();
+    }
+  };
+
+  const handlePaste = (e) => {
+    e.preventDefault();
+    const pasted = e.clipboardData.getData('text').replace(/\D/g, '').slice(0, 4);
+    if (pasted.length === 4) {
+      const newPin = pasted.split('');
+      setPin(newPin);
+      checkPin(newPin);
+    }
+  };
+
+  return (
+    <div className="pin-gate">
+      <div className="pin-container">
+        <div className="pin-icon">
+          <Lock size={48} />
+        </div>
+        <h1 className="pin-title">Ai Router</h1>
+        <p className="pin-subtitle">Enter your 4-digit PIN to continue</p>
+        <div className={`pin-inputs ${shake ? 'pin-shake' : ''}`}>
+          {pin.map((digit, i) => (
+            <input
+              key={i}
+              ref={el => pinRefs.current[i] = el}
+              type="password"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              maxLength={1}
+              value={digit}
+              onChange={(e) => handleChange(i, e.target.value)}
+              onKeyDown={(e) => handleKeyDown(i, e)}
+              onPaste={handlePaste}
+              className={`pin-input ${error ? 'pin-input-error' : ''}`}
+              autoFocus={i === 0}
+            />
+          ))}
+        </div>
+        {error && <p className="pin-error-text">Incorrect PIN. Try again.</p>}
+      </div>
+    </div>
+  );
+};
+
 // Inner component logic
 const MapContent = ({ apiKey }) => {
   const { isLoaded, loadError } = useJsApiLoader({
@@ -117,11 +225,30 @@ const MapContent = ({ apiKey }) => {
   });
 
   const [map, setMap] = React.useState(null);
-  const [groups, setGroups] = useState([
-    { id: 'default', name: 'Route 1', color: GROUP_COLORS[0].value, visible: true }
-  ]);
-  const [activeGroupId, setActiveGroupId] = useState('default');
-  const [stops, setStops] = useState([]);
+  const [groups, setGroups] = useState(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEYS.GROUPS);
+      if (saved) return JSON.parse(saved);
+    } catch (e) { /* ignore parse errors */ }
+    return [{ id: 'default', name: 'Route 1', color: GROUP_COLORS[0].value, visible: true }];
+  });
+  const [activeGroupId, setActiveGroupId] = useState(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEYS.GROUPS);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed.length > 0) return parsed[0].id;
+      }
+    } catch (e) { /* ignore */ }
+    return 'default';
+  });
+  const [stops, setStops] = useState(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEYS.STOPS);
+      if (saved) return JSON.parse(saved);
+    } catch (e) { /* ignore parse errors */ }
+    return [];
+  });
   const [routeResults, setRouteResults] = useState({});
   const [routeStats, setRouteStats] = useState({});
 
@@ -149,6 +276,15 @@ const MapContent = ({ apiKey }) => {
   // Editing state for stop labels
   const [editingStopId, setEditingStopId] = useState(null);
   const [editingStopLabel, setEditingStopLabel] = useState('');
+
+  // Auto-save groups and stops to localStorage
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEYS.GROUPS, JSON.stringify(groups));
+  }, [groups]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEYS.STOPS, JSON.stringify(stops));
+  }, [stops]);
 
   const onLoad = useCallback(function callback(map) {
     if (window.google) {
@@ -588,6 +724,54 @@ const MapContent = ({ apiKey }) => {
     }
   };
 
+  // --- Export/Import Routes ---
+  const exportRoutes = () => {
+    const data = {
+      groups,
+      stops,
+      exportedAt: new Date().toISOString(),
+      version: 1
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `routes-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const importRoutes = () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json';
+    input.onchange = (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        try {
+          const data = JSON.parse(event.target.result);
+          if (data.groups && Array.isArray(data.groups) && data.stops && Array.isArray(data.stops)) {
+            setGroups(data.groups);
+            setStops(data.stops);
+            setRouteResults({});
+            setRouteStats({});
+            setActiveGroupId(data.groups[0]?.id || 'default');
+          } else {
+            alert('Invalid route file format.');
+          }
+        } catch (err) {
+          alert('Could not read route file.');
+        }
+      };
+      reader.readAsText(file);
+    };
+    input.click();
+  };
+
   const clearRoute = (groupId) => {
     const newResults = { ...routeResults };
     delete newResults[groupId];
@@ -906,6 +1090,11 @@ const MapContent = ({ apiKey }) => {
             </button>
             <button className="btn btn-secondary" style={{ flex: 1 }} onClick={shareRoute} disabled={stops.length === 0}><Share2 size={16} /> Share</button>
           </div>
+          <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem' }}>
+            <button className="btn btn-secondary" style={{ flex: 1 }} onClick={exportRoutes} disabled={stops.length === 0}><Download size={16} /> Export</button>
+            <button className="btn btn-secondary" style={{ flex: 1 }} onClick={importRoutes}><Upload size={16} /> Import</button>
+          </div>
+          <p style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: '0.5rem', textAlign: 'center' }}>Routes auto-save to this browser</p>
         </div>
 
       </div>
@@ -1056,7 +1245,11 @@ const MapContent = ({ apiKey }) => {
 const VERIFIED_API_KEY = 'AIzaSyB8kIoYTyiBGk9yY5fjojW0ndVNqDshFIc';
 
 function App() {
-  return <MapContent apiKey={VERIFIED_API_KEY} />;
+  return (
+    <PinGate>
+      <MapContent apiKey={VERIFIED_API_KEY} />
+    </PinGate>
+  );
 }
 
 export default App;
