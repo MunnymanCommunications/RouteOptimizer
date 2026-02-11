@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useRef, useEffect, useImperativeHandle } from 'react';
 import { GoogleMap, useJsApiLoader, Marker, DirectionsRenderer, Polyline } from '@react-google-maps/api';
-import { MapPin, Navigation, Plus, Trash2, Truck, Layers, Eye, EyeOff, FolderPlus, Circle, Printer, Share2, GripVertical, Edit3, Check, Lock, Download, Upload } from 'lucide-react';
+import { MapPin, Navigation, Plus, Trash2, Truck, Layers, Eye, EyeOff, FolderPlus, Circle, Printer, Share2, GripVertical, Edit3, Check, Lock, Upload } from 'lucide-react';
 import './index.css';
 
 // Helper: Convert 0-based index to letter (A, B, C, ... Z, AA, AB...)
@@ -57,7 +57,60 @@ const formatDuration = (seconds) => {
   if (h > 0) return `${h}h ${m}m`;
   return `${m} min`;
 };
-// --- Web Component Wrapper for Places API (New) ---
+// --- CSV Parsing Helpers ---
+const parseCSV = (text) => {
+  const rows = [];
+  let current = '';
+  let inQuotes = false;
+  let row = [];
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (inQuotes) {
+      if (char === '"' && text[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else if (char === '"') {
+        inQuotes = false;
+      } else {
+        current += char;
+      }
+    } else {
+      if (char === '"') {
+        inQuotes = true;
+      } else if (char === ',') {
+        row.push(current);
+        current = '';
+      } else if (char === '\n' || (char === '\r' && text[i + 1] === '\n')) {
+        row.push(current);
+        current = '';
+        rows.push(row);
+        row = [];
+        if (char === '\r') i++;
+      } else {
+        current += char;
+      }
+    }
+  }
+  if (current || row.length > 0) {
+    row.push(current);
+    rows.push(row);
+  }
+  return rows;
+};
+
+const findColumn = (headers, candidates) => {
+  for (const candidate of candidates) {
+    const idx = headers.indexOf(candidate);
+    if (idx !== -1) return idx;
+  }
+  for (const candidate of candidates) {
+    const idx = headers.findIndex(h => h.includes(candidate));
+    if (idx !== -1) return idx;
+  }
+  return -1;
+};
+
 // --- Web Component Wrapper for Places API (New) ---
 const PlaceComponent = React.forwardRef(({ onPlaceSelect, onInputChange, placeholder }, ref) => {
   const innerRef = useRef(null);
@@ -724,50 +777,113 @@ const MapContent = ({ apiKey }) => {
     }
   };
 
-  // --- Export/Import Routes ---
-  const exportRoutes = () => {
-    const data = {
-      groups,
-      stops,
-      exportedAt: new Date().toISOString(),
-      version: 1
-    };
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `routes-${new Date().toISOString().slice(0, 10)}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  };
+  // --- CSV Import ---
+  const [csvImporting, setCsvImporting] = useState(false);
+  const [csvProgress, setCsvProgress] = useState({ current: 0, total: 0 });
 
-  const importRoutes = () => {
+  const importCSV = () => {
+    if (csvImporting) return;
     const input = document.createElement('input');
     input.type = 'file';
-    input.accept = '.json';
-    input.onchange = (e) => {
+    input.accept = '.csv';
+    input.onchange = async (e) => {
       const file = e.target.files[0];
       if (!file) return;
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        try {
-          const data = JSON.parse(event.target.result);
-          if (data.groups && Array.isArray(data.groups) && data.stops && Array.isArray(data.stops)) {
-            setGroups(data.groups);
-            setStops(data.stops);
-            setRouteResults({});
-            setRouteStats({});
-            setActiveGroupId(data.groups[0]?.id || 'default');
-          } else {
-            alert('Invalid route file format.');
-          }
-        } catch (err) {
-          alert('Could not read route file.');
+
+      setCsvImporting(true);
+      const text = await file.text();
+      const rows = parseCSV(text);
+
+      if (rows.length < 2) {
+        alert('CSV file is empty or has no data rows.');
+        setCsvImporting(false);
+        return;
+      }
+
+      const headers = rows[0].map(h => h.toLowerCase().trim());
+      const dataRows = rows.slice(1).filter(row => row.some(cell => cell.trim()));
+
+      // Find address-related columns
+      const addressCol = findColumn(headers, ['address', 'full_address', 'full address', 'location', 'destination']);
+      const streetCol = findColumn(headers, ['street', 'street_address', 'street address', 'address1', 'address_1', 'address 1']);
+      const cityCol = findColumn(headers, ['city', 'town']);
+      const stateCol = findColumn(headers, ['state', 'province', 'st']);
+      const zipCol = findColumn(headers, ['zip', 'zipcode', 'zip_code', 'zip code', 'postal', 'postal_code']);
+      const labelCol = findColumn(headers, ['label', 'name', 'stop_name', 'stop name', 'description', 'notes', 'customer']);
+
+      setCsvProgress({ current: 0, total: dataRows.length });
+
+      const geocoder = new window.google.maps.Geocoder();
+      const newStops = [];
+
+      for (let i = 0; i < dataRows.length; i++) {
+        const row = dataRows[i];
+        let address = '';
+
+        if (addressCol !== -1) {
+          address = row[addressCol]?.trim() || '';
+        } else if (streetCol !== -1) {
+          const parts = [];
+          if (row[streetCol]?.trim()) parts.push(row[streetCol].trim());
+          if (cityCol !== -1 && row[cityCol]?.trim()) parts.push(row[cityCol].trim());
+          if (stateCol !== -1 && row[stateCol]?.trim()) parts.push(row[stateCol].trim());
+          if (zipCol !== -1 && row[zipCol]?.trim()) parts.push(row[zipCol].trim());
+          address = parts.join(', ');
+        } else {
+          // Fallback: use the first non-empty cell
+          address = row.find(cell => cell.trim())?.trim() || '';
         }
-      };
-      reader.readAsText(file);
+
+        if (!address) continue;
+
+        const label = labelCol !== -1 ? (row[labelCol]?.trim() || '') : '';
+
+        try {
+          const result = await new Promise((resolve, reject) => {
+            geocoder.geocode({ address }, (results, status) => {
+              if (status === 'OK' && results[0]) resolve(results[0]);
+              else reject(new Error(status));
+            });
+          });
+
+          newStops.push({
+            id: Date.now() + i,
+            lat: result.geometry.location.lat(),
+            lng: result.geometry.location.lng(),
+            address: result.formatted_address,
+            label,
+            groupId: activeGroupId
+          });
+        } catch (err) {
+          console.warn(`Could not geocode: "${address}"`, err.message);
+        }
+
+        setCsvProgress({ current: i + 1, total: dataRows.length });
+
+        // Small delay to avoid geocoding rate limits
+        if (i < dataRows.length - 1) {
+          await new Promise(r => setTimeout(r, 200));
+        }
+      }
+
+      if (newStops.length > 0) {
+        setStops(prev => [...prev, ...newStops]);
+        clearRoute(activeGroupId);
+
+        if (map && newStops[0]) {
+          map.panTo({ lat: newStops[0].lat, lng: newStops[0].lng });
+          map.setZoom(10);
+        }
+      }
+
+      setCsvImporting(false);
+      setCsvProgress({ current: 0, total: 0 });
+
+      if (newStops.length === 0) {
+        alert('No addresses could be found in the CSV file.');
+      } else if (newStops.length < dataRows.length) {
+        alert(`Added ${newStops.length} of ${dataRows.length} addresses. Some could not be geocoded.`);
+      }
     };
     input.click();
   };
@@ -1090,10 +1206,16 @@ const MapContent = ({ apiKey }) => {
             </button>
             <button className="btn btn-secondary" style={{ flex: 1 }} onClick={shareRoute} disabled={stops.length === 0}><Share2 size={16} /> Share</button>
           </div>
-          <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem' }}>
-            <button className="btn btn-secondary" style={{ flex: 1 }} onClick={exportRoutes} disabled={stops.length === 0}><Download size={16} /> Export</button>
-            <button className="btn btn-secondary" style={{ flex: 1 }} onClick={importRoutes}><Upload size={16} /> Import</button>
-          </div>
+          <button className="btn btn-secondary" style={{ width: '100%', marginTop: '0.5rem' }} onClick={importCSV} disabled={csvImporting}>
+            <Upload size={16} /> {csvImporting ? `Importing... (${csvProgress.current}/${csvProgress.total})` : 'Upload CSV'}
+          </button>
+          {csvImporting && (
+            <div style={{ marginTop: '0.5rem' }}>
+              <div style={{ width: '100%', height: '4px', background: 'var(--bg-dark)', borderRadius: '2px', overflow: 'hidden' }}>
+                <div style={{ width: `${csvProgress.total > 0 ? (csvProgress.current / csvProgress.total) * 100 : 0}%`, height: '100%', background: 'var(--accent-primary)', borderRadius: '2px', transition: 'width 0.3s ease' }} />
+              </div>
+            </div>
+          )}
           <p style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: '0.5rem', textAlign: 'center' }}>Routes auto-save to this browser</p>
         </div>
 
