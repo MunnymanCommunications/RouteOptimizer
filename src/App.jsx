@@ -217,11 +217,15 @@ const MapContent = ({ apiKey }) => {
       let location = null;
 
       if (selectedPlace) {
+        // Use displayName as label if it's a recognizable place name (not same as address)
+        const placeName = selectedPlace.displayName || '';
+        const address = selectedPlace.formattedAddress || selectedPlace.displayName;
+        const autoLabel = (placeName && placeName !== address) ? placeName : '';
         location = {
           lat: selectedPlace.location.lat(),
           lng: selectedPlace.location.lng(),
-          address: selectedPlace.formattedAddress || selectedPlace.displayName,
-          label: '',
+          address: address,
+          label: autoLabel,
           id: Date.now(),
           groupId: activeGroupId
         };
@@ -239,11 +243,14 @@ const MapContent = ({ apiKey }) => {
 
         if (places && places.length > 0) {
           const place = places[0];
+          const placeName = place.displayName || '';
+          const address = place.formattedAddress || place.displayName;
+          const autoLabel = (placeName && placeName !== address) ? placeName : '';
           location = {
             lat: place.location.lat(),
             lng: place.location.lng(),
-            address: place.formattedAddress || place.displayName,
-            label: '',
+            address: address,
+            label: autoLabel,
             id: Date.now(),
             groupId: activeGroupId
           };
@@ -296,10 +303,12 @@ const MapContent = ({ apiKey }) => {
   };
 
   // --- Drag and Drop Logic ---
+  const stopsListRef = useRef(null);
+  const dragScrollInterval = useRef(null);
+
   const handleDragStart = (e, stopId, groupId) => {
     setDragItem({ stopId, groupId });
     e.dataTransfer.effectAllowed = 'move';
-    // Make the drag ghost semi-transparent
     e.currentTarget.style.opacity = '0.4';
   };
 
@@ -307,6 +316,10 @@ const MapContent = ({ apiKey }) => {
     e.currentTarget.style.opacity = '1';
     setDragItem(null);
     setDragOverItem(null);
+    if (dragScrollInterval.current) {
+      clearInterval(dragScrollInterval.current);
+      dragScrollInterval.current = null;
+    }
   };
 
   const handleDragOver = (e, stopId, groupId) => {
@@ -314,6 +327,28 @@ const MapContent = ({ apiKey }) => {
     e.dataTransfer.dropEffect = 'move';
     if (dragItem && dragItem.groupId === groupId) {
       setDragOverItem({ stopId, groupId });
+    }
+
+    // Auto-scroll the stops list when dragging near edges
+    const listEl = stopsListRef.current;
+    if (!listEl) return;
+    const rect = listEl.getBoundingClientRect();
+    const scrollZone = 50;
+    const y = e.clientY;
+
+    if (dragScrollInterval.current) {
+      clearInterval(dragScrollInterval.current);
+      dragScrollInterval.current = null;
+    }
+
+    if (y < rect.top + scrollZone && listEl.scrollTop > 0) {
+      dragScrollInterval.current = setInterval(() => {
+        listEl.scrollTop -= 8;
+      }, 16);
+    } else if (y > rect.bottom - scrollZone && listEl.scrollTop < listEl.scrollHeight - listEl.clientHeight) {
+      dragScrollInterval.current = setInterval(() => {
+        listEl.scrollTop += 8;
+      }, 16);
     }
   };
 
@@ -447,16 +482,28 @@ const MapContent = ({ apiKey }) => {
         </style>
       </head>
       <body>
-        <h1>🚚 RouteMaster Itinerary</h1>
+        <h1>🚚 Ai Router Itinerary</h1>
     `;
 
     // Add static map if we have stops
     if (visibleStops.length > 0) {
       const markers = visibleStops.map((stop, i) =>
-        `markers=color:blue%7Clabel:${indexToLetter(i)}%7C${stop.lat},${stop.lng}`
+        `markers=color:red%7Clabel:${indexToLetter(i)}%7C${stop.lat},${stop.lng}`
       ).join('&');
-      const staticMapUrl = `https://maps.googleapis.com/maps/api/staticmap?size=800x400&${markers}&key=${VERIFIED_API_KEY}`;
-      printContent += `<img src="${staticMapUrl}" style="width: 100%; max-height: 400px; object-fit: contain; border-radius: 8px; margin-bottom: 20px;" />`;
+
+      // Add route path from directions results if available
+      let pathParam = '';
+      for (const group of groups) {
+        if (!group.visible) continue;
+        const result = routeResults[group.id];
+        if (result && result.routes && result.routes[0] && result.routes[0].overview_polyline) {
+          const encodedPath = result.routes[0].overview_polyline;
+          pathParam += `&path=weight:4%7Ccolor:0x3b82f6ff%7Cenc:${encodedPath}`;
+        }
+      }
+
+      const staticMapUrl = `https://maps.googleapis.com/maps/api/staticmap?size=800x400&maptype=roadmap${pathParam}&${markers}&key=${VERIFIED_API_KEY}`;
+      printContent += `<img src="${staticMapUrl}" style="width: 100%; max-height: 400px; object-fit: contain; border-radius: 8px; margin-bottom: 20px;" onerror="this.style.display='none'" />`;
     }
 
     // Add stops table
@@ -511,7 +558,7 @@ const MapContent = ({ apiKey }) => {
 
     printContent += `
       </table>
-      <p style="margin-top: 20px; color: #666; font-size: 12px;">Generated by RouteMaster</p>
+      <p style="margin-top: 20px; color: #666; font-size: 12px;">Generated by Ai Router</p>
       </body></html>
     `;
 
@@ -553,7 +600,62 @@ const MapContent = ({ apiKey }) => {
   };
 
   // --- Routing Logic ---
-  const calculateAllRoutes = async () => {
+  const calculateRoutesInOrder = async () => {
+    const directionsService = new window.google.maps.DirectionsService();
+    const newResults = { ...routeResults };
+    const newStats = { ...routeStats };
+    let hasUpdates = false;
+
+    for (const group of groups) {
+      if (!group.visible) continue;
+
+      const groupStops = stops.filter(s => s.groupId === group.id);
+      if (groupStops.length < 2) continue;
+
+      const origin = groupStops[0];
+      const destination = groupStops[groupStops.length - 1];
+      const intermediateStops = groupStops.slice(1, groupStops.length - 1);
+
+      const waypoints = intermediateStops.map(stop => ({
+        location: stop.address,
+        stopover: true
+      }));
+
+      try {
+        const result = await directionsService.route({
+          origin: origin.address,
+          destination: destination.address,
+          waypoints: waypoints,
+          optimizeWaypoints: false,
+          travelMode: window.google.maps.TravelMode.DRIVING
+        });
+
+        newResults[group.id] = result;
+
+        let totalDist = 0;
+        let totalDur = 0;
+        result.routes[0].legs.forEach(leg => {
+          totalDist += leg.distance.value;
+          totalDur += leg.duration.value;
+        });
+
+        newStats[group.id] = {
+          distance: metersToMiles(totalDist),
+          duration: formatDuration(totalDur)
+        };
+        hasUpdates = true;
+      } catch (error) {
+        console.error(`Error calculating route for ${group.name}:`, error);
+      }
+    }
+
+    if (hasUpdates) {
+      setRouteResults(newResults);
+      setRouteStats(newStats);
+    }
+  };
+
+  const optimizeRoutes = async () => {
     const directionsService = new window.google.maps.DirectionsService();
     const newResults = { ...routeResults };
     const newStats = { ...routeStats };
@@ -660,7 +762,7 @@ const MapContent = ({ apiKey }) => {
         <div className="sidebar-header">
           <div className="logo">
             <Truck size={24} color="#3b82f6" />
-            <span>RouteMaster</span>
+            <span>Ai Router</span>
           </div>
         </div>
 
@@ -735,7 +837,7 @@ const MapContent = ({ apiKey }) => {
 
 
         {/* Stops List */}
-        <div className="stops-list">
+        <div className="stops-list" ref={stopsListRef}>
           {groups.map(group => {
             if (!group.visible) return null;
             const groupStops = stops.filter(s => s.groupId === group.id);
@@ -791,7 +893,8 @@ const MapContent = ({ apiKey }) => {
         </div>
 
         <div className="route-actions" style={{ marginTop: 'auto' }}>
-          <button className="btn btn-primary" style={{ width: '100%', marginBottom: '0.5rem' }} onClick={calculateAllRoutes} disabled={stops.length < 2}><Navigation size={18} /> Calculate Optimal Routes</button>
+          <button className="btn btn-primary" style={{ width: '100%', marginBottom: '0.5rem' }} onClick={calculateRoutesInOrder} disabled={stops.length < 2}><Navigation size={18} /> Calculate Route in Current Order</button>
+          <button className="btn btn-optimize" style={{ width: '100%', marginBottom: '0.5rem' }} onClick={optimizeRoutes} disabled={stops.length < 2}><Truck size={18} /> Optimize Route</button>
           <div style={{ display: 'flex', gap: '0.5rem' }}>
             <button
               className={`btn btn-secondary ${Object.keys(routeResults).length > 0 ? 'btn-pulsing' : ''}`}

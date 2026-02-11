@@ -148,6 +148,26 @@ gmp-place-autocomplete::part(input):focus {
   box-shadow: 0 6px 16px var(--accent-glow);
 }
 
+.btn-optimize {
+  background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+  color: white;
+  box-shadow: 0 4px 12px rgba(16, 185, 129, 0.4);
+}
+
+.btn-optimize:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(16, 185, 129, 0.5);
+}
+
+.btn-optimize:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  box-shadow: none;
+  transform: none;
+  pointer-events: none;
+  filter: grayscale(100%);
+}
+
 .btn-icon {
   padding: 0.75rem;
   background: var(--bg-card);
